@@ -1,26 +1,23 @@
-"""Upstage Solar embedding utility with disk caching and parallel API keys.
-
-Models:
-  - solar-embedding-1-large-passage  (document encoding)
-  - solar-embedding-1-large-query    (query encoding)
-
-Uses multiple API keys (UPSTAGE_API_KEY1..N) for parallel embedding.
-Each key gets its own thread with independent RPM/TPM limits.
-Saves progress incrementally so crashes don't lose work.
-Cache: data/processed/embeddings.npy (float32) + embedding_ids.json
-"""
+"""Upstage Solar embedding utility with disk caching and parallel API keys."""
 
 import json
 import os
 import time
+import threading  # <--- Added
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Lock
 
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
+
+# <--- Added: Try to import Streamlit context helpers safely
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    STREAMLIT_AVAILABLE = True
+except ImportError:
+    STREAMLIT_AVAILABLE = False
 
 load_dotenv()
 
@@ -33,7 +30,7 @@ RPM_LIMIT = 100
 MIN_INTERVAL = 60.0 / RPM_LIMIT
 DIM = 4096
 BASE_URL = "https://api.upstage.ai/v1/solar"
-MAX_CHARS = 12000  # ~3000 tokens, safely under 4000 token limit
+MAX_CHARS = 12000
 MAX_RETRIES = 3
 
 
@@ -75,10 +72,8 @@ def _embed_batch_safe(client: OpenAI, batch: list[str]) -> list[list[float]]:
         except Exception as e:
             err_msg = str(e)
             if "maximum context length" in err_msg or "4000 tokens" in err_msg:
-                # Split batch in half and process separately
                 mid = len(truncated) // 2
                 if mid == 0:
-                    # Single text too long, truncate more aggressively
                     truncated = [t[:MAX_CHARS // 2] for t in truncated]
                     continue
                 left = _embed_batch_safe(client, truncated[:mid])
@@ -89,50 +84,88 @@ def _embed_batch_safe(client: OpenAI, batch: list[str]) -> list[list[float]]:
                 wait = 2 ** (attempt + 1)
                 time.sleep(wait)
             else:
-                raise
+                raise e
+    return []
 
 
 def embed_passages(texts: list[str], ids: list[str], progress_callback=None) -> np.ndarray:
-    """Embed passages using parallel API keys.
+    """Embed passages using parallel API keys."""
+    keys = _get_api_keys()
+    if not keys:
+        raise ValueError("No UPSTAGE_API_KEY found.")
 
-    Args:
-        texts: List of passage strings to embed.
-        ids: List of document IDs (same length as texts).
-        progress_callback: Optional callback(current, total) for progress updates.
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    Returns:
-        np.ndarray of shape (N, 4096), dtype float32.
+    batches = []
+    for i in range(0, len(texts), BATCH_SIZE):
+        batches.append((i, texts[i : i + BATCH_SIZE]))
 
-    Hints:
-        - Use _get_api_keys() to get API keys, OpenAI(api_key=..., base_url=BASE_URL) to create clients
-        - Use _embed_batch_safe(client, batch) to embed a batch of texts
-        - Process texts in chunks of BATCH_SIZE
-        - Save results to EMBEDDINGS_PATH (.npy) and IDS_PATH (.json)
-    """
-    # TODO: Implement embedding logic
-    pass
+    tasks_per_key = [[] for _ in range(len(keys))]
+    for i, batch in enumerate(batches):
+        tasks_per_key[i % len(keys)].append(batch)
+
+    final_embeddings = np.zeros((len(texts), DIM), dtype=np.float32)
+    pbar = tqdm(total=len(texts), desc="Embedding")
+
+    # <--- CRITICAL FIX: Capture the main thread's Streamlit context
+    ctx = get_script_run_ctx() if STREAMLIT_AVAILABLE else None
+
+    def worker(key_idx):
+        # <--- CRITICAL FIX: Attach the context to this worker thread
+        if STREAMLIT_AVAILABLE and ctx:
+            add_script_run_ctx(threading.current_thread(), ctx)
+
+        client = OpenAI(api_key=keys[key_idx], base_url=BASE_URL)
+        my_tasks = tasks_per_key[key_idx]
+
+        for start_idx, batch_texts in my_tasks:
+            start_time = time.time()
+            embeddings = _embed_batch_safe(client, batch_texts)
+
+            for j, emb in enumerate(embeddings):
+                if start_idx + j < len(texts):
+                    final_embeddings[start_idx + j] = emb
+
+            pbar.update(len(batch_texts))
+            
+            # Now this callback works because the thread has the Streamlit context
+            if progress_callback:
+                progress_callback(pbar.n, pbar.total)
+
+            elapsed = time.time() - start_time
+            if elapsed < MIN_INTERVAL:
+                time.sleep(MIN_INTERVAL - elapsed)
+
+    with ThreadPoolExecutor(max_workers=len(keys)) as executor:
+        futures = [executor.submit(worker, i) for i in range(len(keys))]
+        for f in as_completed(futures):
+            f.result()
+
+    pbar.close()
+
+    print(f"Saving to {EMBEDDINGS_PATH}...")
+    np.save(EMBEDDINGS_PATH, final_embeddings)
+    with open(IDS_PATH, "w", encoding="utf-8") as f:
+        json.dump(ids, f)
+
+    return final_embeddings
 
 
 def embed_query(query: str) -> list[float]:
-    """Embed a single query using the query model.
+    """Embed a single query using the query model."""
+    keys = _get_api_keys()
+    if not keys:
+        raise ValueError("No UPSTAGE_API_KEY found.")
 
-    Args:
-        query: The search query string.
-
-    Returns:
-        list[float] of length 4096 (embedding vector).
-
-    Hints:
-        - Use _get_api_keys() to get an API key
-        - Model name: "solar-embedding-1-large-query"
-        - Use _truncate() to handle long queries
-    """
-    # TODO: Implement query embedding
-    pass
+    client = OpenAI(api_key=keys[0], base_url=BASE_URL)
+    response = client.embeddings.create(
+        model="solar-embedding-1-large-query",
+        input=_truncate(query)
+    )
+    return response.data[0].embedding
 
 
 def load_cached_embeddings() -> tuple[np.ndarray, list[str]] | None:
-    """Load cached embeddings from disk. Returns (embeddings, ids) or None."""
     if EMBEDDINGS_PATH.exists() and IDS_PATH.exists():
         embeddings = np.load(EMBEDDINGS_PATH)
         ids = json.loads(IDS_PATH.read_text())

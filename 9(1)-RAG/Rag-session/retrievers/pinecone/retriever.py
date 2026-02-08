@@ -27,5 +27,25 @@ def search(query: str, top_k: int = 10) -> list[dict]:
         - Use index.query(vector=..., top_k=..., include_metadata=True)
         - Text is in match["metadata"]["text"]
     """
-    # TODO: Implement vector search
-    pass
+    query_vector = embed_query(query)
+    
+    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+    index_name = os.getenv("PINECONE_INDEX_NAME")
+    index = pc.Index(index_name)
+
+    response = index.query(
+        vector=query_vector,
+        top_k=top_k,
+        include_metadata=True
+    )
+    
+    results = []
+    for match in response.matches:
+        results.append({
+            "id": match.id,
+            "text": match.metadata.get("text", ""),
+            "score": match.score,
+            "method": "Vector"
+        })
+        
+    return results

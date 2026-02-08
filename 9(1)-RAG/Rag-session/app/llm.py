@@ -48,5 +48,28 @@ def generate(question: str, context: str | None = None) -> str:
         - Use client.chat.completions.create(model=MODEL, messages=[...])
         - Set temperature=0 for deterministic output, max_tokens=1024
     """
-    # TODO: Implement LLM answer generation
-    pass
+    
+    if context:
+        prompt_content = RAG_PROMPT.format(context=context, question=question)
+    else:
+        prompt_content = NO_RAG_PROMPT.format(question=question)
+
+
+    client = OpenAI(
+        api_key=_get_api_key(),
+        base_url=BASE_URL
+    )
+
+    
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "user", "content": prompt_content}
+            ],
+            temperature=0,      
+            max_tokens=1024     
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error generating answer: {str(e)}"

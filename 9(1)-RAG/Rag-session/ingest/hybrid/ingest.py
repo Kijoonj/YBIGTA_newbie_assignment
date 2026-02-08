@@ -78,8 +78,48 @@ def ingest(progress_callback=None):
         - Use elasticsearch.helpers.bulk() with chunk_size=100
         - Call es.indices.refresh() after bulk ingest
     """
-    # TODO: Implement ES Hybrid ingestion
-    pass
+    emb_path = PROCESSED_DIR / "embeddings.npy"
+    ids_path = PROCESSED_DIR / "embedding_ids.json"
+    corpus_path = RAW_DIR / "corpus.jsonl"
+
+    if not emb_path.exists() or not ids_path.exists():
+        raise FileNotFoundError("Embeddings not found. Run ingest/embedding.py first.")
+
+    print("Loading embeddings...")
+    embeddings = np.load(emb_path)
+    ids = json.loads(ids_path.read_text(encoding="utf-8"))
+
+    # 2. Initialize Elasticsearch
+    es = get_es_client()
+
+    # 3. Reset Index
+    if es.indices.exists(index=INDEX_NAME):
+        print(f"Deleting existing index: {INDEX_NAME}")
+        es.indices.delete(index=INDEX_NAME)
+    
+    print(f"Creating index: {INDEX_NAME}")
+    es.indices.create(index=INDEX_NAME, mappings=INDEX_MAPPINGS)
+
+    # 4. Bulk Ingest
+    print("Starting bulk ingestion...")
+    # chunk_size is smaller (100) because vectors are large payload
+    success_count, errors = bulk(
+        es,
+        _generate_actions(corpus_path, embeddings, ids),
+        chunk_size=100
+    )
+
+    if errors:
+        print(f"Errors during ingestion: {errors}")
+
+    # 5. Refresh to make data searchable
+    es.indices.refresh(index=INDEX_NAME)
+
+    if progress_callback:
+        progress_callback(success_count)
+    
+    print(f"Successfully ingested {success_count} documents into {INDEX_NAME}.")
+    return success_count
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Hybrid retriever using Elasticsearch RRF (Reciprocal Rank Fusion).
 
 Combines BM25 text search with dense vector kNN search.
-Uses ES 8.14+ RRF support with rank_constant=60.
+Uses ES 8.14+ RRF support.
 """
 
 import os
@@ -25,23 +25,59 @@ def get_es_client() -> Elasticsearch:
 
 
 def search(query: str, top_k: int = 10, candidate_size: int = 50) -> list[dict]:
-    """RRF hybrid search combining BM25 + kNN.
+    """RRF hybrid search combining BM25 + kNN."""
+    
+    # 1. Generate Query Vector
+    query_vector = embed_query(query)
+    
+    es = get_es_client()
+    
+    # 2. Construct RRF Query
+    # Note: "window_size" is now "rank_window_size" in newer ES versions
+    retriever_config = {
+        "rrf": {
+            "retrievers": [
+                # Standard BM25 Retriever
+                {
+                    "standard": {
+                        "query": {
+                            "match": {
+                                "text": query
+                            }
+                        }
+                    }
+                },
+                # kNN Vector Retriever
+                {
+                    "knn": {
+                        "field": "embedding",
+                        "query_vector": query_vector,
+                        "k": candidate_size,
+                        "num_candidates": candidate_size * 2
+                    }
+                }
+            ],
+            "rank_constant": 60,
+            "rank_window_size": top_k  # <--- FIXED HERE
+        }
+    }
 
-    Args:
-        query: Search query string.
-        top_k: Number of results to return.
-        candidate_size: Number of kNN candidates before RRF fusion.
-
-    Returns:
-        list[dict], each dict has keys: "id", "text", "score", "method".
-        "method" should be "Hybrid (RRF)".
-
-    Hints:
-        - Use embed_query(query) to get the query embedding vector
-        - Use get_es_client() and es.search() with "retriever" parameter
-        - RRF retriever combines "standard" (BM25 match) + "knn" retrievers
-        - kNN field: "embedding", rank_constant: 60
-        - num_candidates = candidate_size * 2
-    """
-    # TODO: Implement hybrid RRF search
-    pass
+    # 3. Execute Search
+    response = es.search(
+        index=INDEX_NAME,
+        retriever=retriever_config,
+        size=top_k,
+        source_excludes=["embedding"]
+    )
+    
+    # 4. Format Results
+    results = []
+    for hit in response["hits"]["hits"]:
+        results.append({
+            "id": hit["_id"],
+            "text": hit["_source"]["text"],
+            "score": hit["_score"],
+            "method": "Hybrid (RRF)"
+        })
+        
+    return results

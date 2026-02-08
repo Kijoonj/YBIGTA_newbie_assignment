@@ -63,8 +63,32 @@ def ingest(progress_callback=None):
         - Use elasticsearch.helpers.bulk() with chunk_size=500
         - Call es.indices.refresh() after bulk ingest
     """
-    # TODO: Implement ES BM25 ingestion
-    pass
+    es = get_es_client()
+    corpus_path = RAW_DIR / "corpus.jsonl"
+
+    if not corpus_path.exists():
+        raise FileNotFoundError(f"Corpus file not found at {corpus_path}")
+
+    # 1. Reset Index
+    if es.indices.exists(index=INDEX_NAME):
+        es.indices.delete(index=INDEX_NAME)
+    
+    es.indices.create(index=INDEX_NAME, mappings=INDEX_MAPPINGS)
+    
+    success_count, errors = bulk(
+        es,
+        _generate_actions(corpus_path),
+        chunk_size=500
+    )
+
+    if errors:
+        print(f"Errors occurred during ingestion: {errors}")
+    es.indices.refresh(index=INDEX_NAME)
+
+    if progress_callback:
+        progress_callback(success_count)
+
+    return success_count
 
 
 if __name__ == "__main__":

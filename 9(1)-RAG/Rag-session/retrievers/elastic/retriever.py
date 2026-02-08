@@ -34,5 +34,27 @@ def search(query: str, top_k: int = 10) -> list[dict]:
         - Index name: INDEX_NAME
         - Use "match" query on "text" field
     """
-    # TODO: Implement BM25 search
-    pass
+    es = get_es_client()
+    
+    # Standard BM25 query
+    body = {
+        "query": {
+            "match": {
+                "text": query
+            }
+        },
+        "size": top_k
+    }
+
+    response = es.search(index=INDEX_NAME, body=body)
+    
+    results = []
+    for hit in response["hits"]["hits"]:
+        results.append({
+            "id": hit["_id"],
+            "text": hit["_source"]["text"],
+            "score": hit["_score"],
+            "method": "BM25"
+        })
+        
+    return results
